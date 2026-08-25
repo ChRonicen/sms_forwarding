@@ -145,7 +145,7 @@ void handleRoot() {
     // URL
     channelsHtml += "<div class=\"form-group\">";
     channelsHtml += "<label>推送URL/Webhook</label>";
-    channelsHtml += "<input type=\"text\" name=\"push" + idx + "url\" value=\"" + config.pushChannels[i].url + "\" placeholder=\"http://your-server.com/api 或 webhook地址\">";
+    channelsHtml += "<input type=\"text\" name=\"push" + idx + "url\" id=\"url" + idx + "\" value=\"" + config.pushChannels[i].url + "\" placeholder=\"http://your-server.com/api 或 webhook地址\">";
     channelsHtml += "</div>";
     
     // 额外参数区域（钉钉/PushPlus/Server酱等需要）
@@ -172,6 +172,10 @@ void handleRoot() {
   }
   html.replace("%PUSH_CHANNELS%", channelsHtml);
   
+  // 禁用缓存：固件更新后确保浏览器拉取新版页面，避免旧版 UI 与新固件不匹配
+  server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+  server.sendHeader("Pragma", "no-cache");
+  server.sendHeader("Expires", "0");
   server.send(200, "text/html", html);
 }
 
@@ -961,6 +965,7 @@ void handleLog() {
     json += "\"" + jsonEscape(logBuffer[pos]) + "\"";
   }
   json += "]";
+  server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
   server.send(200, "application/json", json);
 }
 
