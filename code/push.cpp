@@ -135,53 +135,114 @@ String jsonEscape(const String& str) {
   return result;
 }
 
-// 发送单个推送通道
+// 判断业务响应体是否表示成功
+// 部分平台无论成败 HTTP 都返回 200，错误信息在响应体中，需要额外校验
+static bool isBodySuccess(const PushChannel& channel, const String& resp) {
+  switch (channel.type) {
+    case PUSH_TYPE_DINGTALK:   return resp.indexOf("\"errcode\":0") >= 0;
+    case PUSH_TYPE_FEISHU:     return resp.indexOf("\"code\":0") >= 0;
+    case PUSH_TYPE_PUSHPLUS:   return resp.indexOf("\"code\":200") >= 0;
+    case PUSH_TYPE_SERVERCHAN: return resp.indexOf("\"code\":0") >= 0;
+    case PUSH_TYPE_TELEGRAM:   return resp.indexOf("\"ok\":true") >= 0;
+    default:                   return true; // 其余平台以 HTTP 状态码为准
+  }
+}
+
+// 带重试地执行单个通道的 HTTP 请求（最多 3 次，失败后退避重试）
+static bool executeChannelRequest(const PushChannel& channel, const String& url,
+                                  bool isGet, const String& contentType, const String& body,
+                                  const String& channelName) {
+  const int MAX_ATTEMPTS = 3;
+  for (int attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    if (attempt > 1) {
+      delay(500 * (attempt - 1)); // 退避：第2次前等0.5秒，第3次前等1秒
+      logCaptureF("[%s] 重试 (%d/%d)...\n", channelName.c_str(), attempt, MAX_ATTEMPTS);
+    }
+
+    HTTPClient http;
+    http.begin(url);
+    if (!isGet) http.addHeader("Content-Type", contentType);
+    int httpCode = isGet ? http.GET() : http.POST(body);
+
+    if (httpCode <= 0) {
+      // 连接失败/超时等传输层错误，可重试
+      logCaptureF("[%s] HTTP请求失败: %s\n", channelName.c_str(), http.errorToString(httpCode).c_str());
+    } else {
+      logCaptureF("[%s] 响应码: %d\n", channelName.c_str(), httpCode);
+      bool httpOk = (httpCode >= 200 && httpCode < 300);
+      String resp = "";
+      if (httpOk) resp = http.getString();
+
+      if (httpOk && isBodySuccess(channel, resp)) {
+        logCaptureF("[%s] 推送成功（第 %d/%d 次尝试）\n", channelName.c_str(), attempt, MAX_ATTEMPTS);
+        if (resp.length() > 0) logCaptureLn(String("响应: " + resp));
+        http.end();
+        return true;
+      }
+
+      if (resp.length() > 0) logCaptureLn(String("响应: " + resp));
+
+      // 明确的 4xx 客户端错误（除 429 限流）多为配置问题，重试无意义
+      if (httpCode >= 400 && httpCode < 500 && httpCode != 429) {
+        logCaptureF("[%s] 客户端错误 %d，跳过重试\n", channelName.c_str(), httpCode);
+        http.end();
+        return false;
+      }
+      logCaptureLn(String("[" + channelName + "] 本次推送未确认成功"));
+    }
+    http.end();
+  }
+
+  logCaptureLn(String("[" + channelName + "] 多次重试后仍失败"));
+  return false;
+}
+
+// 发送单个推送通道（统一构建请求参数，由 executeChannelRequest 执行并自动重试）
 void sendToChannel(const PushChannel& channel, const char* sender, const char* message, const char* timestamp) {
   if (!channel.enabled) return;
-  
+
   // 对于某些推送方式，URL可以为空（使用默认URL）
-  bool needUrl = (channel.type == PUSH_TYPE_POST_JSON || channel.type == PUSH_TYPE_BARK || 
-                  channel.type == PUSH_TYPE_GET || channel.type == PUSH_TYPE_DINGTALK || 
+  bool needUrl = (channel.type == PUSH_TYPE_POST_JSON || channel.type == PUSH_TYPE_BARK ||
+                  channel.type == PUSH_TYPE_GET || channel.type == PUSH_TYPE_DINGTALK ||
                   channel.type == PUSH_TYPE_CUSTOM);
   if (needUrl && channel.url.length() == 0) return;
-  
-  HTTPClient http;
+
   String channelName = channel.name.length() > 0 ? channel.name : ("通道" + String(channel.type));
   logCaptureLn(String("发送到推送通道: " + channelName));
-  
-  int httpCode = 0;
+
   String senderEscaped = jsonEscape(String(sender));
   String messageEscaped = jsonEscape(String(message));
   String timestampEscaped = jsonEscape(String(timestamp));
-  
+
+  String reqUrl = "";
+  String reqBody = "";
+  String reqContentType = "application/json";
+  bool useGet = false;
+
   switch (channel.type) {
     case PUSH_TYPE_POST_JSON: {
       // 标准POST JSON格式
-      http.begin(channel.url);
-      http.addHeader("Content-Type", "application/json");
-      String jsonData = "{";
-      jsonData += "\"sender\":\"" + senderEscaped + "\",";
-      jsonData += "\"message\":\"" + messageEscaped + "\",";
-      jsonData += "\"timestamp\":\"" + timestampEscaped + "\"";
-      jsonData += "}";
-      logCaptureLn(String("POST JSON: " + jsonData));
-      httpCode = http.POST(jsonData);
+      reqUrl = channel.url;
+      reqBody = "{";
+      reqBody += "\"sender\":\"" + senderEscaped + "\",";
+      reqBody += "\"message\":\"" + messageEscaped + "\",";
+      reqBody += "\"timestamp\":\"" + timestampEscaped + "\"";
+      reqBody += "}";
+      logCaptureLn(String("POST JSON: " + reqBody));
       break;
     }
-    
+
     case PUSH_TYPE_BARK: {
       // Bark推送格式
-      http.begin(channel.url);
-      http.addHeader("Content-Type", "application/json");
-      String jsonData = "{";
-      jsonData += "\"title\":\"" + senderEscaped + "\",";
-      jsonData += "\"body\":\"" + messageEscaped + "\"";
-      jsonData += "}";
-      logCaptureLn(String("BARK JSON: " + jsonData));
-      httpCode = http.POST(jsonData);
+      reqUrl = channel.url;
+      reqBody = "{";
+      reqBody += "\"title\":\"" + senderEscaped + "\",";
+      reqBody += "\"body\":\"" + messageEscaped + "\"";
+      reqBody += "}";
+      logCaptureLn(String("BARK JSON: " + reqBody));
       break;
     }
-    
+
     case PUSH_TYPE_GET: {
       // GET请求，参数放URL里
       String getUrl = channel.url;
@@ -194,16 +255,14 @@ void sendToChannel(const PushChannel& channel, const char* sender, const char* m
       getUrl += "&message=" + urlEncode(String(message));
       getUrl += "&timestamp=" + urlEncode(String(timestamp));
       logCaptureLn(String("GET URL: " + getUrl));
-      http.begin(getUrl);
-      httpCode = http.GET();
+      reqUrl = getUrl;
+      useGet = true;
       break;
     }
-    
+
     case PUSH_TYPE_DINGTALK: {
-      // 钉钉机器人
+      // 钉钉机器人（如果配置了secret，需要添加签名）
       String webhookUrl = channel.url;
-      
-      // 如果配置了secret，需要添加签名
       if (channel.key1.length() > 0) {
         // 获取UTC毫秒级时间戳（钉钉要求）
         int64_t ts = getUtcMillis();
@@ -218,22 +277,17 @@ void sendToChannel(const PushChannel& channel, const char* sender, const char* m
         snprintf(tsBuf, sizeof(tsBuf), "%lld", ts);
         webhookUrl += "timestamp=" + String(tsBuf) + "&sign=" + sign;
       }
-      
-      http.begin(webhookUrl);
-      http.addHeader("Content-Type", "application/json");
-      String jsonData = "{\"msgtype\":\"text\",\"text\":{\"content\":\"";
-      jsonData += "📱短信通知\\n发送者: " + senderEscaped + "\\n内容: " + messageEscaped + "\\n时间: " + timestampEscaped;
-      jsonData += "\"}}";
-      logCaptureLn(String("钉钉: " + jsonData));
-      httpCode = http.POST(jsonData);
+      reqUrl = webhookUrl;
+      reqBody = "{\"msgtype\":\"text\",\"text\":{\"content\":\"";
+      reqBody += "📱短信通知\\n发送者: " + senderEscaped + "\\n内容: " + messageEscaped + "\\n时间: " + timestampEscaped;
+      reqBody += "\"}}";
+      logCaptureLn(String("钉钉: " + reqBody));
       break;
     }
 
     case PUSH_TYPE_PUSHPLUS: {
       // PushPlus
-      String pushUrl = channel.url.length() > 0 ? channel.url : "http://www.pushplus.plus/send";
-      http.begin(pushUrl);
-      http.addHeader("Content-Type", "application/json");
+      reqUrl = channel.url.length() > 0 ? channel.url : "http://www.pushplus.plus/send";
       // 发送渠道
       String channelValue = "wechat";
       if (channel.key2.length() > 0) {
@@ -244,54 +298,47 @@ void sendToChannel(const PushChannel& channel, const char* sender, const char* m
               logCaptureLn(String("Invalid PushPlus channel '" + channel.key2 + "'. Using default 'wechat'."));
           }
       }
-      String jsonData = "{";
-      jsonData += "\"token\":\"" + channel.key1 + "\",";
-      jsonData += "\"title\":\"短信来自: " + senderEscaped + "\",";
-      jsonData += "\"content\":\"<b>发送者:</b> " + senderEscaped + "<br><b>时间:</b> " + timestampEscaped + "<br><b>内容:</b><br>" + messageEscaped + "\",";
-      jsonData += "\"channel\":\"" + channelValue + "\"";
-      jsonData += "}";
-      logCaptureLn(String("PushPlus: " + jsonData));
-      httpCode = http.POST(jsonData);
+      reqBody = "{";
+      reqBody += "\"token\":\"" + channel.key1 + "\",";
+      reqBody += "\"title\":\"短信来自: " + senderEscaped + "\",";
+      reqBody += "\"content\":\"<b>发送者:</b> " + senderEscaped + "<br><b>时间:</b> " + timestampEscaped + "<br><b>内容:</b><br>" + messageEscaped + "\",";
+      reqBody += "\"channel\":\"" + channelValue + "\"";
+      reqBody += "}";
+      logCaptureLn(String("PushPlus: " + reqBody));
       break;
     }
 
     case PUSH_TYPE_SERVERCHAN: {
       // Server酱
-      String scUrl = channel.url.length() > 0 ? channel.url : ("https://sctapi.ftqq.com/" + channel.key1 + ".send");
-      http.begin(scUrl);
-      http.addHeader("Content-Type", "application/x-www-form-urlencoded");
-      String postData = "title=" + urlEncode("短信来自: " + String(sender));
-      postData += "&desp=" + urlEncode("**发送者:** " + String(sender) + "\n\n**时间:** " + String(timestamp) + "\n\n**内容:**\n\n" + String(message));
-      logCaptureLn(String("Server酱: " + postData));
-      httpCode = http.POST(postData);
+      reqUrl = channel.url.length() > 0 ? channel.url : ("https://sctapi.ftqq.com/" + channel.key1 + ".send");
+      reqContentType = "application/x-www-form-urlencoded";
+      reqBody = "title=" + urlEncode("短信来自: " + String(sender));
+      reqBody += "&desp=" + urlEncode("**发送者:** " + String(sender) + "\n\n**时间:** " + String(timestamp) + "\n\n**内容:**\n\n" + String(message));
+      logCaptureLn(String("Server酱: " + reqBody));
       break;
     }
-    
+
     case PUSH_TYPE_CUSTOM: {
       // 自定义模板
       if (channel.customBody.length() == 0) {
         logCaptureLn(String("自定义模板为空，跳过"));
         return;
       }
-      http.begin(channel.url);
-      http.addHeader("Content-Type", "application/json");
-      String body = channel.customBody;
-      body.replace("{sender}", senderEscaped);
-      body.replace("{message}", messageEscaped);
-      body.replace("{timestamp}", timestampEscaped);
-      logCaptureLn(String("自定义: " + body));
-      httpCode = http.POST(body);
+      reqUrl = channel.url;
+      reqBody = channel.customBody;
+      reqBody.replace("{sender}", senderEscaped);
+      reqBody.replace("{message}", messageEscaped);
+      reqBody.replace("{timestamp}", timestampEscaped);
+      logCaptureLn(String("自定义: " + reqBody));
       break;
     }
-    
+
     case PUSH_TYPE_FEISHU: {
       // 飞书机器人
-      String webhookUrl = channel.url;
       String jsonData = "{";
-      
-      // 如果配置了secret，需要添加签名
+
+      // 如果配置了secret，需要添加签名（飞书使用秒级时间戳）
       if (channel.key1.length() > 0) {
-        // 飞书使用秒级时间戳
         int64_t ts = time(nullptr);
         // 飞书签名: base64(HMAC-SHA256(key=timestamp + "\n" + secret, msg=""))
         String stringToSign = String(ts) + "\n" + channel.key1;
@@ -303,79 +350,63 @@ void sendToChannel(const PushChannel& channel, const char* sender, const char* m
         mbedtls_md_hmac_finish(&ctx, hmacResult);
         mbedtls_md_free(&ctx);
         String sign = base64::encode(hmacResult, 32);
-        
+
         jsonData += "\"timestamp\":\"" + String(ts) + "\",";
         jsonData += "\"sign\":\"" + sign + "\",";
       }
-      
+
       // 飞书消息体
       jsonData += "\"msg_type\":\"text\",";
       jsonData += "\"content\":{\"text\":\"";
       jsonData += "📱短信通知\\n发送者: " + senderEscaped + "\\n内容: " + messageEscaped + "\\n时间: " + timestampEscaped;
       jsonData += "\"}}";
-      
-      http.begin(webhookUrl);
-      http.addHeader("Content-Type", "application/json");
-      logCaptureLn(String("飞书: " + jsonData));
-      httpCode = http.POST(jsonData);
+
+      reqUrl = channel.url;
+      reqBody = jsonData;
+      logCaptureLn(String("飞书: " + reqBody));
       break;
     }
-    
+
     case PUSH_TYPE_GOTIFY: {
       // Gotify 推送
       String gotifyUrl = channel.url;
       // 确保URL以/结尾
       if (!gotifyUrl.endsWith("/")) gotifyUrl += "/";
       gotifyUrl += "message?token=" + channel.key1;
-      
-      http.begin(gotifyUrl);
-      http.addHeader("Content-Type", "application/json");
-      String jsonData = "{";
-      jsonData += "\"title\":\"短信来自: " + senderEscaped + "\",";
-      jsonData += "\"message\":\"" + messageEscaped + "\\n\\n时间: " + timestampEscaped + "\",";
-      jsonData += "\"priority\":5";
-      jsonData += "}";
-      logCaptureLn(String("Gotify: " + jsonData));
-      httpCode = http.POST(jsonData);
+
+      reqUrl = gotifyUrl;
+      reqBody = "{";
+      reqBody += "\"title\":\"短信来自: " + senderEscaped + "\",";
+      reqBody += "\"message\":\"" + messageEscaped + "\\n\\n时间: " + timestampEscaped + "\",";
+      reqBody += "\"priority\":5";
+      reqBody += "}";
+      logCaptureLn(String("Gotify: " + reqBody));
       break;
     }
-    
+
     case PUSH_TYPE_TELEGRAM: {
-      // Telegram Bot 推送
-      // channel.key1 是 Chat ID, channel.key2 是 Bot Token
+      // Telegram Bot 推送（key1: Chat ID, key2: Bot Token）
       String tgBaseUrl = channel.url.length() > 0 ? channel.url : "https://api.telegram.org";
       if (tgBaseUrl.endsWith("/")) tgBaseUrl.remove(tgBaseUrl.length() - 1);
-      
-      String tgUrl = tgBaseUrl + "/bot" + channel.key2 + "/sendMessage";
-      http.begin(tgUrl);
-      http.addHeader("Content-Type", "application/json");
-      
-      String jsonData = "{";
-      jsonData += "\"chat_id\":\"" + channel.key1 + "\",";
+
+      reqUrl = tgBaseUrl + "/bot" + channel.key2 + "/sendMessage";
+
       String text = "📱短信通知\n发送者: " + senderEscaped + "\n内容: " + messageEscaped + "\n时间: " + timestampEscaped;
-      jsonData += "\"text\":\"" + text + "\"";
-      jsonData += "}";
-      
-      logCaptureLn(String("Telegram: " + jsonData));
-      httpCode = http.POST(jsonData);
+      reqBody = "{";
+      reqBody += "\"chat_id\":\"" + channel.key1 + "\",";
+      reqBody += "\"text\":\"" + text + "\"";
+      reqBody += "}";
+
+      logCaptureLn(String("Telegram: " + reqBody));
       break;
     }
-    
+
     default:
       logCaptureLn(String("未知推送类型"));
       return;
   }
-  
-  if (httpCode > 0) {
-    logCaptureF("[%s] 响应码: %d\n", channelName.c_str(), httpCode);
-    if (httpCode == HTTP_CODE_OK || httpCode == HTTP_CODE_CREATED) {
-      String response = http.getString();
-      logCaptureLn(String("响应: " + response));
-    }
-  } else {
-    logCaptureF("[%s] HTTP请求失败: %s\n", channelName.c_str(), http.errorToString(httpCode).c_str());
-  }
-  http.end();
+
+  executeChannelRequest(channel, reqUrl, useGet, reqContentType, reqBody, channelName);
 }
 
 // 发送短信到所有启用的推送通道

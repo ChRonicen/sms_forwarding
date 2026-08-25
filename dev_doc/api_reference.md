@@ -174,13 +174,38 @@
 ---
 
 ### `void sendToChannel(const PushChannel& channel, const char* sender, const char* message, const char* timestamp)`
-**核心推送函数**。根据 `channel.type` 分发到 10 种推送方式之一。每个 case 构建对应的 HTTP 请求（URL/Header/Body），使用 `HTTPClient` 发送，打印响应码和内容。
+**核心推送函数**。根据 `channel.type` 构建对应的 HTTP 请求参数（URL/ContentType/Body），统一交给 `executeChannelRequest()` 发送（内置重试）。
 
 **签名相关**:
 - 钉钉: `HMAC-SHA256(timestamp+"\n"+secret)` → Base64 → URLEncode → 追加到 URL
 - 飞书: `HMAC-SHA256(timestamp+"\n"+secret)` → Base64 → 放入 JSON body
 
 **占位符**: 自定义模板（PUSH_TYPE_CUSTOM）支持 `{sender}` `{message}` `{timestamp}` 占位符替换。
+
+---
+
+### `bool executeChannelRequest(...)` — 通道请求执行器（带重试）
+**重试策略**: 最多尝试 3 次，失败后递增退避（0.5s / 1s）。
+
+| 结果 | 处理 |
+|---|---|
+| 连接失败/超时（`httpCode <= 0`） | 记录错误 → 重试 |
+| HTTP 2xx 且响应体业务码正确 | 成功返回 true |
+| HTTP 4xx（除 429） | 配置问题，立即放弃不重试 |
+| HTTP 5xx / 429 / 业务码不符 | 重试 |
+| 3 次均失败 | 返回 false，日志提示已丢弃 |
+
+### `bool isBodySuccess(const PushChannel& channel, const String& resp)` — 响应体业务码校验
+部分平台无论成败 HTTP 都返回 200，需检查响应体：
+
+| 平台 | 成功标志 |
+|---|---|
+| 钉钉 | `"errcode":0` |
+| 飞书 | `"code":0` |
+| PushPlus | `"code":200` |
+| Server酱 | `"code":0` |
+| Telegram | `"ok":true` |
+| 其余平台 | 不检查，以 HTTP 状态码为准 |
 
 ---
 
