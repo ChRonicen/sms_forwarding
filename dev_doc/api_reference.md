@@ -148,13 +148,15 @@
 ## 模块: push.cpp — 推送与邮件
 
 ### `void sendEmailNotification(const char* subject, const char* body)`
-**前提检查**: SMTP 四个字段均非空，否则打印跳过日志。
+**前提检查**: WiFi 已连接且 SMTP 四个字段均非空，否则打印跳过日志。
+
+**重试机制**: 最多尝试 3 次，失败后递增退避（1s/2s）；每次尝试前 `smtp.stop()` 清理残留连接状态；认证失败属配置错误，不重试直接返回。
 
 **实现**:
-1. 创建 `smtp.connect(server, port, callback)`
-2. `smtp.authenticate(user, pass, readymail_auth_password)`
+1. 创建 `smtp.connect(server, port, callback)`，返回值 false 则重试
+2. `smtp.authenticate(user, pass, readymail_auth_password)`，失败则停止重试（配置错误）
 3. 构造 `SMTPMessage`，设置 from/to/subject/body/timestamp
-4. `smtp.send(msg)`
+4. `smtp.send(msg)`，返回值 false 则重试
 
 **from 格式**: `"sms notify <user@example.com>"`  
 **to 格式**: `"your_email <receiver@example.com>"`  

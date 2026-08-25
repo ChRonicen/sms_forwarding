@@ -7,20 +7,44 @@
 #include <base64.h>
 #include <sys/time.h>
 
-// 发送邮件通知函数
+// 发送邮件通知函数（带重试）
 void sendEmailNotification(const char* subject, const char* body) {
   if (config.smtpServer.length() == 0 || config.smtpUser.length() == 0 || 
       config.smtpPass.length() == 0 || config.smtpSendTo.length() == 0) {
     logCaptureLn(String("邮件配置不完整，跳过发送"));
     return;
   }
-  
+
+  if (WiFi.status() != WL_CONNECTED) {
+    logCaptureLn(String("WiFi未连接，跳过邮件发送"));
+    return;
+  }
+
   auto statusCallback = [](SMTPStatus status) {
     logCaptureLn(String(status.text));
   };
-  smtp.connect(config.smtpServer.c_str(), config.smtpPort, statusCallback);
-  if (smtp.isConnected()) {
-    smtp.authenticate(config.smtpUser.c_str(), config.smtpPass.c_str(), readymail_auth_password);
+
+  const int MAX_ATTEMPTS = 3; // 总尝试次数（含首次）
+  for (int attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    if (attempt > 1) {
+      delay(1000 * (attempt - 1)); // 退避：第2次前等1秒，第3次前等2秒
+      logCaptureF("[邮件] 重试 (%d/%d)...\n", attempt, MAX_ATTEMPTS);
+    }
+
+    // 清理上一次尝试的残留连接状态，确保每次从干净状态开始
+    smtp.stop();
+
+    if (!smtp.connect(config.smtpServer.c_str(), config.smtpPort, statusCallback)) {
+      logCaptureLn(String("邮件服务器连接失败"));
+      continue;
+    }
+
+    if (!smtp.authenticate(config.smtpUser.c_str(), config.smtpPass.c_str(), readymail_auth_password)) {
+      // 认证失败属配置错误，重试无意义
+      logCaptureLn(String("邮件认证失败（请检查账号与SMTP授权码），停止重试"));
+      smtp.stop();
+      return;
+    }
 
     SMTPMessage msg;
     String from = "sms notify <"; from += config.smtpUser; from += ">";
@@ -30,11 +54,17 @@ void sendEmailNotification(const char* subject, const char* body) {
     msg.headers.add(rfc822_subject, subject);
     msg.text.body(body);
     msg.timestamp = time(nullptr);
-    smtp.send(msg);
-    logCaptureLn(String("邮件发送完成"));
-  } else {
-    logCaptureLn(String("邮件服务器连接失败"));
+
+    if (smtp.send(msg)) {
+      logCaptureF("[邮件] 发送成功（第 %d/%d 次尝试）\n", attempt, MAX_ATTEMPTS);
+      smtp.stop();
+      return;
+    }
+    logCaptureLn(String("邮件发送失败"));
   }
+
+  logCaptureLn(String("邮件多次重试后仍失败，本次通知已丢弃"));
+  smtp.stop();
 }
 
 // URL编码辅助函数
