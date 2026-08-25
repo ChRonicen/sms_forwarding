@@ -54,6 +54,9 @@
    ├── server.on("/flight", handleFlightMode)
    ├── server.on("/at", handleATCommand)
    ├── server.on("/log", handleLog)                          # 系统日志 JSON
+   ├── server.on("/modem", handleModem)
+   ├── server.on("/wifi", handleWifi)
+   ├── server.on("/system", handleSystem)                    # 整机重启
    └── server.begin()
 
 9. 启动通知

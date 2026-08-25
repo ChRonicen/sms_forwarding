@@ -241,6 +241,14 @@ const char* htmlPage = R"rawliteral(
           </table>
         </div>
       </div>
+      <div class="card">
+        <div class="card-header">🔄 系统控制</div>
+        <div class="card-body">
+          <button class="btn btn-danger" onclick="systemRestart()">重启系统</button>
+          <p class="form-hint">重启整个设备（ESP32 + 模组），期间无法接收短信和访问网页，约需 1 分钟恢复</p>
+          <div class="result-box" id="sysRestartResult"></div>
+        </div>
+      </div>
     </div>
 
     <!-- ===== Account ===== -->
@@ -513,6 +521,31 @@ const char* htmlPage = R"rawliteral(
         if(d.success){r.className='result-box result-success';r.innerHTML='Ping 成功 — '+d.message;}
         else{r.className='result-box result-error';r.innerHTML='Ping 失败 — '+d.message;}
       }).catch(function(e){b.disabled=false;b.textContent='Ping 8.8.8.8';r.className='result-box result-error';r.textContent='请求失败: '+e;});
+    }
+
+    // ---- System Control ----
+    var sysReloadTimer = null;
+    function scheduleSysReload(){
+      if (sysReloadTimer) return;
+      var left = 30, r = document.getElementById('sysRestartResult');
+      r.className = 'result-box result-success';
+      r.textContent = '系统重启中，' + left + ' 秒后自动刷新页面...';
+      sysReloadTimer = setInterval(function(){
+        left--;
+        if(left <= 0){ clearInterval(sysReloadTimer); location.reload(); }
+        else r.textContent = '系统重启中，' + left + ' 秒后自动刷新页面...';
+      }, 1000);
+    }
+    function systemRestart(){
+      if(!confirm('确定要重启整个系统吗？重启期间将无法接收短信和访问网页。'))return;
+      var r=document.getElementById('sysRestartResult');
+      r.className='result-box result-loading';r.textContent='正在发送重启请求...';
+      fetch('/system?action=restart').then(function(rr){return rr.json()}).then(function(d){
+        scheduleSysReload();
+      }).catch(function(e){
+        // 重启导致连接中断属正常现象
+        scheduleSysReload();
+      });
     }
 
     // ---- WiFi Control ----

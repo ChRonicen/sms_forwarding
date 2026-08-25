@@ -1110,3 +1110,20 @@ void handleWifi() {
   }
   busy = false;
 }
+
+// 系统控制命令
+void handleSystem() {
+  if (!checkAuth()) return;
+
+  String action = server.arg("action");
+  if (action == "restart") {
+    // 整机重启 — 先响应浏览器再重启，防止浏览器超时重试
+    logCaptureLn(String("网页端请求重启系统..."));
+    server.send(200, "application/json", "{\"success\":true,\"message\":\"系统正在重启，请等待约 30 秒后刷新页面\"}");
+    delay(500);  // 确保响应完整发出
+    logCaptureLn(String("系统重启中..."));
+    ESP.restart();
+  } else {
+    server.send(200, "application/json", "{\"success\":false,\"message\":\"未知操作\"}");
+  }
+}

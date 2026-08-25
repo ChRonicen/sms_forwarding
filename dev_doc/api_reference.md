@@ -400,3 +400,15 @@ HTTP Basic Authentication，账号密码来自 `config.webUser` / `config.webPas
 5. 返回 JSON `{success, message}`
 
 **注意**: 整个操作最长约 35 秒。
+
+---
+
+### `void handleSystem()`
+系统控制命令，路由 `GET /system`。
+
+| action | 行为 |
+|---|---|
+| `restart` | 先返回 JSON 成功响应 → `delay(500)` 确保发出 → `ESP.restart()` 整机重启 |
+| 其他 | 返回 `{"success":false,"message":"未知操作"}` |
+
+**注意**: 重启后设备需重新走完整启动流程（WiFi + 模组初始化），约 1 分钟恢复。
