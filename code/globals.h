@@ -35,6 +35,14 @@ extern WebServer server;
 extern bool configValid;
 extern bool timeSynced;
 extern bool modemReady;
+extern bool modemInitializing;
+enum OperatorApplyStatus : uint8_t {
+  OPERATOR_STATUS_UNKNOWN,
+  OPERATOR_STATUS_APPLYING,
+  OPERATOR_STATUS_APPLIED,
+  OPERATOR_STATUS_FAILED
+};
+extern OperatorApplyStatus operatorApplyStatus;
 extern unsigned long lastPrintTime;
 extern ConcatSms concatBuffer[MAX_CONCAT_MESSAGES];
 

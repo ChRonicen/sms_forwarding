@@ -199,6 +199,7 @@ const char* htmlPage = R"rawliteral(
       <a data-panel="email"><span class="ico">📧</span> <span>邮件通知</span></a>
       <a data-panel="push"><span class="ico">🔗</span> <span>推送通道</span></a>
       <a data-panel="admin"><span class="ico">👤</span> <span>管理员 &amp; 黑名单</span></a>
+      <a data-panel="operator"><span class="ico">📶</span> <span>选网配置</span></a>
       <div class="sidebar-divider"></div>
       <div class="sidebar-section-label">工具</div>
       <a data-panel="sendsms"><span class="ico">📤</span> <span>发送短信</span></a>
@@ -250,6 +251,13 @@ const char* htmlPage = R"rawliteral(
         </div>
       </div>
     </div>
+
+    <div class="panel" id="panel-operator"><h1 class="page-title">选网配置</h1><form action="/save" method="POST">
+      <div class="card"><div class="card-body"><div class="form-group"><label class="form-label">选网模式</label><select class="form-input" name="operatorMode" id="operatorMode" onchange="toggleOperatorFields()"><option value="0"%OP_MODE_AUTO%>自动选择</option><option value="1"%OP_MODE_MANUAL%>手动指定</option></select></div>
+      <div id="manualOperatorFields" class="form-row"><div class="form-group"><label class="form-label">PLMN（MCC + MNC）</label><input class="form-input" name="operatorCode" value="%OPERATOR_CODE%"></div>
+      <div class="form-group"><label class="form-label">接入制式</label><select class="form-input" name="operatorAct"><option value="7"%OP_ACT_LTE%>LTE</option><option value="2"%OP_ACT_UTRAN%>3G</option><option value="0"%OP_ACT_GSM%>2G</option></select></div></div>
+      <p class="form-hint">当前状态：%OPERATOR_STATUS%</p></div></div>
+      <button type="submit" class="btn btn-primary btn-block btn-save">保存并应用</button></form></div>
 
     <!-- ===== Account ===== -->
     <div class="panel" id="panel-account">
@@ -505,8 +513,10 @@ const char* htmlPage = R"rawliteral(
       else if (type == 9) { hint.innerHTML = 'Gotify<br>填写服务器地址 + 应用 Token'; extra.style.display='block'; document.getElementById('key1label'+idx).innerText='Token（应用 Token）'; document.getElementById('key1'+idx).placeholder='A...'; }
       else if (type == 10) { hint.innerHTML = 'Telegram Bot<br>Chat ID（参数1）+ Bot Token（参数2）'; extra.style.display='block'; document.getElementById('key1label'+idx).innerText='Chat ID'; document.getElementById('key1'+idx).placeholder='123456789'; if(kg)kg.style.display='block'; document.getElementById('key2label'+idx).innerText='Bot Token'; document.getElementById('key2'+idx).placeholder='12345678:ABC...'; }
     }
+    function toggleOperatorFields(){var m=document.getElementById('operatorMode'),f=document.getElementById('manualOperatorFields');if(m&&f)f.style.display=m.value==='1'?'flex':'none';}
     document.addEventListener('DOMContentLoaded', function() {
       for (var i = 0; i < 5; i++) { toggleChannel(i); updateTypeHint(i); }
+      toggleOperatorFields();
     });
 
     // ---- Send SMS ----

@@ -62,6 +62,12 @@ void logCaptureLn(const char* msg) {
   _logCommit();
 }
 
+static bool rejectWhileModemInitializing() {
+  if (!modemInitializing) return false;
+  server.send(503, "application/json", "{\"success\":false,\"message\":\"模组初始化中\"}");
+  return true;
+}
+
 // 检查HTTP Basic认证
 bool checkAuth() {
   if (!server.authenticate(config.webUser.c_str(), config.webPass.c_str())) {
@@ -92,6 +98,20 @@ void handleRoot() {
   html.replace("%SMTP_SEND_TO%", config.smtpSendTo);
   html.replace("%ADMIN_PHONE%", config.adminPhone);
   html.replace("%NUMBER_BLACK_LIST%", config.numberBlackList);
+  html.replace("%OP_MODE_AUTO%", config.operatorMode == 0 ? " selected" : "");
+  html.replace("%OP_MODE_MANUAL%", config.operatorMode == 1 ? " selected" : "");
+  html.replace("%OPERATOR_CODE%", config.operatorCode);
+  html.replace("%OP_ACT_GSM%", config.operatorAct == 0 ? " selected" : "");
+  html.replace("%OP_ACT_UTRAN%", config.operatorAct == 2 ? " selected" : "");
+  html.replace("%OP_ACT_LTE%", config.operatorAct == 7 ? " selected" : "");
+  String operatorStatus = "尚未应用";
+  if (operatorApplyStatus == OPERATOR_STATUS_APPLYING) operatorStatus = "正在应用配置";
+  else if (operatorApplyStatus == OPERATOR_STATUS_APPLIED) {
+    operatorStatus = config.operatorMode == 1 ? "已按配置手动选网" : "已按配置自动选网";
+  } else if (operatorApplyStatus == OPERATOR_STATUS_FAILED) {
+    operatorStatus = "配置应用失败，请在模组诊断中检查实际运营商";
+  }
+  html.replace("%OPERATOR_STATUS%", operatorStatus);
 
   // 概览页面的配置状态
   bool emailOk = config.smtpServer.length() > 0 && config.smtpUser.length() > 0 &&
@@ -187,6 +207,7 @@ void handleToolsPage() {
 // 处理飞行模式控制请求
 void handleFlightMode() {
   if (!checkAuth()) return;
+  if (rejectWhileModemInitializing()) return;
   
   String action = server.arg("action");
   String json = "{";
@@ -295,6 +316,7 @@ void handleFlightMode() {
 // 处理AT指令测试请求
 void handleATCommand() {
   if (!checkAuth()) return;
+  if (rejectWhileModemInitializing()) return;
   
   String cmd = server.arg("cmd");
   bool success = false;
@@ -326,6 +348,7 @@ void handleATCommand() {
 // 处理模组信息查询请求
 void handleQuery() {
   if (!checkAuth()) return;
+  if (rejectWhileModemInitializing()) return;
   
   String type = server.arg("type");
   String json = "{";
@@ -528,7 +551,7 @@ void handleQuery() {
     // 查询PDP上下文激活状态
     resp = sendATCommand("AT+CGACT?", 2000);
     String pdpStatus = "未激活";
-    if (resp.indexOf("+CGACT: 1,1") >= 0) {
+    if (isPdpContextActive(resp, 1)) {
       pdpStatus = "已激活";
     } else if (resp.indexOf("+CGACT:") >= 0) {
       pdpStatus = "未激活";
@@ -617,6 +640,7 @@ void handleQuery() {
 // 处理发送短信请求
 void handleSendSms() {
   if (!checkAuth()) return;
+  if (rejectWhileModemInitializing()) return;
   
   String phone = server.arg("phone");
   String content = server.arg("content");
@@ -673,14 +697,12 @@ void handleSendSms() {
 // 处理Ping请求
 void handlePing() {
   if (!checkAuth()) return;
+  if (rejectWhileModemInitializing()) return;
   
   logCaptureLn(String("网页端发起Ping请求"));
   
-  // 清空串口缓冲区
-  while (Serial1.available()) Serial1.read();
-  
-  // 激活PDP上下文（数据连接）
-  logCaptureLn(String("激活数据连接(CGACT)..."));
+  // 网络测试是唯一主动激活蜂窝数据的入口；结束后无论成败都关闭。
+  logCaptureLn(String("为网络测试临时激活数据连接(CGACT)..."));
   String activateResp = sendATCommand("AT+CGACT=1,1", 10000);
   logCaptureLn(String("CGACT响应: " + activateResp));
   
@@ -690,8 +712,6 @@ void handlePing() {
     logCaptureLn(String("数据连接激活失败，尝试继续执行..."));
   }
   
-  // 清空串口缓冲区
-  while (Serial1.available()) Serial1.read();
   delay(500);  // 等待网络稳定
   
   // 发送MPING命令，ping 8.8.8.8，超时30秒，ping 1次
@@ -818,13 +838,13 @@ void handlePing() {
     }
     
     if (gotError || gotPingResult) break;
-    server.handleClient();
+    delay(1);
   }
   
   logCaptureLn(String("\nPing操作完成"));
   
   // 关闭数据连接以节省流量
-  logCaptureLn(String("关闭PDP上下文(CGACT=0)..."));
+  logCaptureLn(String("网络测试结束，关闭PDP上下文(CGACT=0)..."));
   String deactivateResp = sendATCommand("AT+CGACT=0,1", 5000);
   logCaptureLn(String("CGACT关闭响应: " + deactivateResp));
   
@@ -851,6 +871,8 @@ void handlePing() {
 // 处理保存配置请求
 void handleSave() {
   if (!checkAuth()) return;
+
+  bool operatorConfigChanged = false;
 
   // 账号管理表单：只在字段存在时更新
   if (server.hasArg("webUser")) {
@@ -888,6 +910,31 @@ void handleSave() {
   }
   if (server.hasArg("numberBlackList")) {
     config.numberBlackList = server.arg("numberBlackList");
+  }
+
+  if (server.hasArg("operatorMode")) {
+    uint8_t newMode = (uint8_t)server.arg("operatorMode").toInt();
+    if (newMode > 1) newMode = 0;
+    String newCode = server.arg("operatorCode");
+    newCode.trim();
+    uint8_t newAct = (uint8_t)server.arg("operatorAct").toInt();
+    if (newAct != 0 && newAct != 2 && newAct != 7) newAct = 7;
+
+    bool validPlmn = newCode.length() == 5 || newCode.length() == 6;
+    for (unsigned int i = 0; validPlmn && i < newCode.length(); i++) {
+      validPlmn = isDigit(newCode.charAt(i));
+    }
+    if (newMode == 1 && !validPlmn) {
+      server.send(400, "text/plain; charset=utf-8", "手动选网需要填写 5 或 6 位数字 PLMN");
+      return;
+    }
+
+    operatorConfigChanged = config.operatorMode != newMode ||
+                            config.operatorCode != newCode ||
+                            config.operatorAct != newAct;
+    config.operatorMode = newMode;
+    config.operatorCode = newCode;
+    config.operatorAct = newAct;
   }
 
   // 推送通道配置：只在对应通道的字段存在时更新
@@ -950,6 +997,11 @@ void handleSave() {
     String body = "设备配置已更新\n设备地址: " + getDeviceUrl();
     sendEmailNotification(subject.c_str(), body.c_str());
   }
+
+  if (operatorConfigChanged) {
+    delay(800);
+    ESP.restart();
+  }
 }
 
 // 处理日志查询请求 — 返回环形缓冲区中的日志行
@@ -973,8 +1025,7 @@ void handleLog() {
 void handleModem() {
   if (!checkAuth()) return;
 
-  // 防止重入：modemInit() 内部会调 server.handleClient()，
-  // 若浏览器超时重试会导致嵌套调用，最终拖垮 WiFi
+  // 模组操作在单次请求内串行执行，避免多个网页操作交叉发送 AT 命令。
   static bool busy = false;
   if (busy) {
     server.send(429, "application/json", "{\"success\":false,\"message\":\"模组正忙，请稍后重试\"}");
@@ -990,12 +1041,17 @@ void handleModem() {
   if (action == "restart") {
     // AT 软重启 — 先响应浏览器再初始化，防止浏览器超时重试
     logCaptureLn(String("网页端请求软重启模组..."));
+    modemInitializing = true;
+    modemReady = false;
     server.send(200, "application/json", "{\"success\":true,\"message\":\"正在软重启模组，请等待约 15 秒后刷新页面\"}");
     String resp = sendATCommand("AT+CFUN=1,1", 15000);
     success = (resp.indexOf("OK") >= 0);
     message = success ? "模组软重启成功" : "软重启失败";
     logCaptureLn(String(message + ": " + resp));
-    if (success) modemInit();
+    if (success) {
+      delay(6000);
+      modemInit();
+    } else modemInitializing = false;
     busy = false;
     return;
   }
@@ -1004,6 +1060,7 @@ void handleModem() {
     logCaptureLn(String("网页端请求硬重启模组..."));
     server.send(200, "application/json", "{\"success\":true,\"message\":\"正在硬重启模组，请等待约 15 秒后刷新页面\"}");
     resetModule();
+    busy = false;
     return;
   }
   else if (action == "signal") {

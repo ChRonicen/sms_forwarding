@@ -1,9 +1,108 @@
 #include "modem.h"
 #include "web_handlers.h"
 
+static bool waitRegistration(const char* command, const char* prefix);
+
+static int terminalResult(const String& response) {
+  int start = 0;
+  while (start < response.length()) {
+    int end = response.indexOf('\n', start);
+    if (end < 0) return 0;
+    String line = response.substring(start, end);
+    line.trim();
+    if (line == "OK") return 1;
+    if (line == "ERROR" || line.startsWith("+CME ERROR:") || line.startsWith("+CMS ERROR:")) return -1;
+    start = end + 1;
+  }
+  return 0;
+}
+
+bool isPdpContextActive(const String& response, int contextId) {
+  int start = 0;
+  while (start < response.length()) {
+    int end = response.indexOf('\n', start);
+    if (end < 0) end = response.length();
+    String line = response.substring(start, end);
+    line.trim();
+    int colon = line.indexOf(':');
+    int comma = line.indexOf(',', colon + 1);
+    if (line.startsWith("+CGACT:") && comma > colon) {
+      int cid = line.substring(colon + 1, comma).toInt();
+      int state = line.substring(comma + 1).toInt();
+      if (cid == contextId) return state == 1;
+    }
+    start = end + 1;
+  }
+  return false;
+}
+
+static bool disableDataConnection() {
+  if (sendATandWaitOK("AT+CGACT=0,1", 5000)) {
+    logCaptureLn(String("已禁用数据连接(CGACT=0,1)"));
+    return true;
+  }
+
+  String state = sendATCommand("AT+CGACT?", 2000);
+  bool inactive = state.indexOf("+CGACT:") >= 0 && !isPdpContextActive(state, 1);
+  logCaptureLn(inactive ? String("数据连接已处于禁用状态")
+                         : String("无法确认数据连接已禁用"));
+  return inactive;
+}
+
+static bool sendATWithRetry(const char* command) {
+  for (int attempt = 0; attempt < 3; attempt++) {
+    if (sendATandWaitOK(command, 3000)) return true;
+    if (attempt < 2) delay(2000);
+  }
+  return false;
+}
+
+static bool configureOperator() {
+  operatorApplyStatus = OPERATOR_STATUS_APPLYING;
+  bool manual = config.operatorMode == 1;
+  if (!manual) {
+    bool success = sendATandWaitOK("AT+COPS=0", 300000);
+    operatorApplyStatus = success ? OPERATOR_STATUS_APPLIED : OPERATOR_STATUS_FAILED;
+    logCaptureLn(success ? String("自动选网成功") : String("自动选网失败"));
+    return success;
+  }
+
+  bool valid = config.operatorCode.length() == 5 || config.operatorCode.length() == 6;
+  for (unsigned int i = 0; valid && i < config.operatorCode.length(); i++) {
+    valid = isDigit(config.operatorCode.charAt(i));
+  }
+  if (!valid) {
+    operatorApplyStatus = OPERATOR_STATUS_FAILED;
+    logCaptureLn(String("手动选网 PLMN 无效"));
+    return false;
+  }
+
+  char command[32];
+  snprintf(command, sizeof(command), "AT+COPS=1,2,\"%s\",%u",
+           config.operatorCode.c_str(), config.operatorAct);
+  if (!sendATandWaitOK(command, 300000)) {
+    operatorApplyStatus = OPERATOR_STATUS_FAILED;
+    logCaptureLn(String("手动选网超时或失败"));
+    return false;
+  }
+  String state = sendATCommand("AT+COPS?", 3000);
+  bool success = state.indexOf("+COPS: 1,") >= 0 && state.indexOf(config.operatorCode) >= 0;
+  operatorApplyStatus = success ? OPERATOR_STATUS_APPLIED : OPERATOR_STATUS_FAILED;
+  logCaptureLn(success ? String("手动选网成功") : String("手动选网状态校验失败"));
+  return success;
+}
+
+static void configureSmsService() {
+  const char* commands[] = {"AT+CEMODE=3", "AT*PSDC=0", "AT+CSMS=1", "AT+CIREG=1"};
+  bool success = true;
+  for (const char* command : commands) {
+    if (!sendATWithRetry(command)) success = false;
+  }
+  if (!success) logCaptureLn(String("短信初始化失败"));
+}
+
 // 发送AT命令并获取响应
 String sendATCommand(const char* cmd, unsigned long timeout) {
-  while (Serial1.available()) Serial1.read();
   Serial1.println(cmd);
   
   unsigned long start = millis();
@@ -12,17 +111,9 @@ String sendATCommand(const char* cmd, unsigned long timeout) {
     if (Serial1.available()) {
       char c = Serial1.read();
       resp += c;
-      if (resp.indexOf("OK") >= 0 || resp.indexOf("ERROR") >= 0) {
-        // 读取剩余数据（最多 50ms）
-        unsigned long t = millis();
-        while (millis() - t < 50) {
-          if (Serial1.available()) resp += (char)Serial1.read();
-          server.handleClient();
-        }
-        return resp;
-      }
+      if (terminalResult(resp) != 0) return resp;
     }
-    server.handleClient();
+    delay(1);
   }
   return resp;
 }
@@ -43,12 +134,17 @@ void modemPowerCycle() {
 // 重启模组（EN引脚断电重启 + 重新初始化）
 void resetModule() {
   logCaptureLn(String("正在硬重启模组（EN 断电重启）..."));
+  modemInitializing = true;
+  modemReady = false;
   modemPowerCycle();
   modemInit();
 }
 
 // 模组 AT 初始化流程（setup 中调用，resetModule 后也调用）
 void modemInit() {
+  modemInitializing = true;
+  modemReady = false;
+
   // 清掉上电噪声/残留
   while (Serial1.available()) Serial1.read();
 
@@ -88,16 +184,20 @@ void modemInit() {
     if(model == "ML307Y") need_set_CGACT = false;
   }
 
+  bool requireIms = config.operatorMode == 1 && config.operatorAct == 7;
+  if (requireIms) configureSmsService();
+
+  // 先选网，再关闭数据连接，避免重新驻网时再次激活普通数据上下文。
+  bool operatorReady = configureOperator();
+
+  bool dataDisabled = true;
   if(need_set_CGACT) {
-    while (!sendATandWaitOK("AT+CGACT=0,1", 5000)) {
-      logCaptureLn(String("设置CGACT失败，重试..."));
-      blink_short();
-    }
-    logCaptureLn(String("已禁用数据连接(AT+CGACT=0,1)，防止流量消耗"));
+    dataDisabled = disableDataConnection();
   } else {
     logCaptureLn(String("该型号无法配置(AT+CGACT=0,1)，跳过该命令，会不会消耗流量？自求多福"));
   }
-  while (!sendATandWaitOK("AT+CNMI=2,2,0,0,0", 1000)) {
+  sendATandWaitOK("AT+CPMS=\"SM\",\"SM\",\"SM\"", 2000);
+  while (!sendATandWaitOK("AT+CNMI=2,1,0,0,0", 1000)) {
     logCaptureLn(String("设置CNMI失败，重试..."));
     blink_short();
   }
@@ -113,13 +213,24 @@ void modemInit() {
     ceregRetry++;
     blink_short();
   }
-  if (ceregRetry < 30) {
+  bool networkReady = ceregRetry < 30;
+  if (networkReady) {
     logCaptureLn(String("网络已注册"));
-    modemReady = true;
   } else {
     logCaptureLn(String("⚠️ 网络注册超时（无SIM卡或信号差），模组功能不可用"));
-    modemReady = false;
   }
+
+  int imsRetry = 0;
+  while (requireIms && networkReady && imsRetry < 20 && !waitCIREG()) {
+    imsRetry++;
+    blink_short();
+  }
+  bool imsReady = !requireIms || (networkReady && imsRetry < 20);
+  if (requireIms) logCaptureLn(imsReady ? String("IMS已注册") : String("IMS注册超时"));
+  // 自动选网或注册过程可能重新激活 PDP，注册完成后再次关闭以保证默认不用流量。
+  if (need_set_CGACT) dataDisabled = disableDataConnection() && dataDisabled;
+  modemReady = operatorReady && networkReady && imsReady && dataDisabled;
+  modemInitializing = false;
 }
 
 void blink_short(unsigned long gap_time) {
@@ -130,7 +241,6 @@ void blink_short(unsigned long gap_time) {
 }
 
 bool sendATandWaitOK(const char* cmd, unsigned long timeout) {
-  while (Serial1.available()) Serial1.read();
   Serial1.println(cmd);
   unsigned long start = millis();
   String resp = "";
@@ -138,40 +248,58 @@ bool sendATandWaitOK(const char* cmd, unsigned long timeout) {
     if (Serial1.available()) {
       char c = Serial1.read();
       resp += c;
-      if (resp.indexOf("OK") >= 0) return true;
-      if (resp.indexOf("ERROR") >= 0) return false;
+      int result = terminalResult(resp);
+      if (result != 0) return result > 0;
     }
-    server.handleClient();
+    delay(1);
   }
   return false;
 }
 
 // 检测网络注册状态（LTE/4G）
 // CEREG状态: 1=已注册本地, 5=已注册漫游
-bool waitCEREG() {
-  Serial1.println("AT+CEREG?");
+static bool waitRegistration(const char* command, const char* prefix) {
+  Serial1.println(command);
   unsigned long start = millis();
   String resp = "";
+  bool registrationSeen = false;
+  bool registered = false;
   while (millis() - start < 2000) {
     if (Serial1.available()) {
       char c = Serial1.read();
       resp += c;
-      if (resp.indexOf("+CEREG:") >= 0) {
-        if (resp.indexOf(",1") >= 0 || resp.indexOf(",5") >= 0) return true;
-        if (resp.indexOf(",0") >= 0 || resp.indexOf(",2") >= 0 || 
-            resp.indexOf(",3") >= 0 || resp.indexOf(",4") >= 0) return false;
+      int prefixPos = resp.indexOf(prefix);
+      int lineEnd = prefixPos >= 0 ? resp.indexOf('\n', prefixPos) : -1;
+      if (prefixPos >= 0 && lineEnd >= 0) {
+        int comma = resp.indexOf(',', prefixPos);
+        if (comma < lineEnd) {
+          int stat = resp.substring(comma + 1, lineEnd).toInt();
+          registrationSeen = true;
+          registered = stat == 1 || stat == 5;
+        }
       }
+      // 不能在看到 +CEREG/+CIREG 行后立即返回：必须消费本命令的终止 OK，
+      // 否则下一条 AT 会把这个旧 OK 误认为自己的响应。
+      int result = terminalResult(resp);
+      if (result != 0) return result > 0 && registrationSeen && registered;
     }
-    server.handleClient();
+    delay(1);
   }
   return false;
+}
+
+bool waitCEREG() {
+  return waitRegistration("AT+CEREG?", "+CEREG:");
+}
+
+bool waitCIREG() {
+  return waitRegistration("AT+CIREG?", "+CIREG:");
 }
 
 // 发送短信（PDU模式）
 bool sendSMS(const char* phoneNumber, const char* message) {
   logCaptureLn(String("准备发送短信..."));
-  logCapture(String("目标号码: ")); logCaptureLn(String(phoneNumber));
-  logCapture(String("短信内容: ")); logCaptureLn(String(message));
+  logCaptureLn(String("短信长度: ") + String(strlen(message)));
 
   // 使用pdulib编码PDU
   pdu.setSCAnumber();  // 使用默认短信中心
@@ -183,14 +311,12 @@ bool sendSMS(const char* phoneNumber, const char* message) {
     return false;
   }
   
-  logCapture(String("PDU数据: ")); logCaptureLn(String(pdu.getSMS()));
   logCapture(String("PDU长度: ")); logCaptureLn(String(pduLen));
   
   // 发送AT+CMGS命令
   String cmgsCmd = "AT+CMGS=";
   cmgsCmd += pduLen;
   
-  while (Serial1.available()) Serial1.read();
   Serial1.println(cmgsCmd);
   
   // 等待 > 提示符
@@ -199,13 +325,12 @@ bool sendSMS(const char* phoneNumber, const char* message) {
   while (millis() - start < 5000) {
     if (Serial1.available()) {
       char c = Serial1.read();
-      logCapture(String(c));
       if (c == '>') {
         gotPrompt = true;
         break;
       }
     }
-    server.handleClient();
+    delay(1);
   }
   
   if (!gotPrompt) {
@@ -224,17 +349,17 @@ bool sendSMS(const char* phoneNumber, const char* message) {
     while (Serial1.available()) {
       char c = Serial1.read();
       resp += c;
-      logCapture(String(c));
-      if (resp.indexOf("OK") >= 0) {
+      int result = terminalResult(resp);
+      if (result > 0) {
         logCaptureLn(String("\n短信发送成功"));
         return true;
       }
-      if (resp.indexOf("ERROR") >= 0) {
+      if (result < 0) {
         logCaptureLn(String("\n短信发送失败"));
         return false;
       }
     }
-    server.handleClient();
+    delay(1);
   }
   logCaptureLn(String("短信发送超时"));
   return false;

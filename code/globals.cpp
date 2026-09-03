@@ -9,5 +9,7 @@ WebServer server(80);
 bool configValid = false;
 bool timeSynced = false;
 bool modemReady = false;
+bool modemInitializing = false;
+OperatorApplyStatus operatorApplyStatus = OPERATOR_STATUS_UNKNOWN;
 unsigned long lastPrintTime = 0;
 ConcatSms concatBuffer[MAX_CONCAT_MESSAGES];

@@ -8,16 +8,16 @@
 #include <sys/time.h>
 
 // 发送邮件通知函数（带重试）
-void sendEmailNotification(const char* subject, const char* body) {
+bool sendEmailNotification(const char* subject, const char* body) {
   if (config.smtpServer.length() == 0 || config.smtpUser.length() == 0 || 
       config.smtpPass.length() == 0 || config.smtpSendTo.length() == 0) {
     logCaptureLn(String("邮件配置不完整，跳过发送"));
-    return;
+    return false;
   }
 
   if (WiFi.status() != WL_CONNECTED) {
     logCaptureLn(String("WiFi未连接，跳过邮件发送"));
-    return;
+    return false;
   }
 
   auto statusCallback = [](SMTPStatus status) {
@@ -43,7 +43,7 @@ void sendEmailNotification(const char* subject, const char* body) {
       // 认证失败属配置错误，重试无意义
       logCaptureLn(String("邮件认证失败（请检查账号与SMTP授权码），停止重试"));
       smtp.stop();
-      return;
+      return false;
     }
 
     SMTPMessage msg;
@@ -58,36 +58,32 @@ void sendEmailNotification(const char* subject, const char* body) {
     if (smtp.send(msg)) {
       logCaptureF("[邮件] 发送成功（第 %d/%d 次尝试）\n", attempt, MAX_ATTEMPTS);
       smtp.stop();
-      return;
+      return true;
     }
     logCaptureLn(String("邮件发送失败"));
   }
 
   logCaptureLn(String("邮件多次重试后仍失败，本次通知已丢弃"));
   smtp.stop();
+  return false;
 }
 
 // URL编码辅助函数
 String urlEncode(const String& str) {
   String encoded = "";
-  char c;
-  char code0;
-  char code1;
   for (unsigned int i = 0; i < str.length(); i++) {
-    c = str.charAt(i);
+    uint8_t c = static_cast<uint8_t>(str.charAt(i));
     if (c == ' ') {
       encoded += '+';
-    } else if (isalnum(c)) {
-      encoded += c;
+    } else if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+               (c >= '0' && c <= '9') || c == '-' || c == '_' ||
+               c == '.' || c == '~') {
+      encoded += static_cast<char>(c);
     } else {
-      code1 = (c & 0xf) + '0';
-      if ((c & 0xf) > 9) code1 = (c & 0xf) - 10 + 'A';
-      c = (c >> 4) & 0xf;
-      code0 = c + '0';
-      if (c > 9) code0 = c - 10 + 'A';
+      static const char hex[] = "0123456789ABCDEF";
       encoded += '%';
-      encoded += code0;
-      encoded += code1;
+      encoded += hex[(c >> 4) & 0x0F];
+      encoded += hex[c & 0x0F];
     }
   }
   return encoded;
@@ -198,14 +194,14 @@ static bool executeChannelRequest(const PushChannel& channel, const String& url,
 }
 
 // 发送单个推送通道（统一构建请求参数，由 executeChannelRequest 执行并自动重试）
-void sendToChannel(const PushChannel& channel, const char* sender, const char* message, const char* timestamp) {
-  if (!channel.enabled) return;
+bool sendToChannel(const PushChannel& channel, const char* sender, const char* message, const char* timestamp) {
+  if (!channel.enabled) return false;
 
   // 对于某些推送方式，URL可以为空（使用默认URL）
   bool needUrl = (channel.type == PUSH_TYPE_POST_JSON || channel.type == PUSH_TYPE_BARK ||
                   channel.type == PUSH_TYPE_GET || channel.type == PUSH_TYPE_DINGTALK ||
                   channel.type == PUSH_TYPE_CUSTOM);
-  if (needUrl && channel.url.length() == 0) return;
+  if (needUrl && channel.url.length() == 0) return false;
 
   String channelName = channel.name.length() > 0 ? channel.name : ("通道" + String(channel.type));
   logCaptureLn(String("发送到推送通道: " + channelName));
@@ -233,13 +229,12 @@ void sendToChannel(const PushChannel& channel, const char* sender, const char* m
     }
 
     case PUSH_TYPE_BARK: {
-      // Bark推送格式
+      // Bark 的设备 Key URL 接受表单正文；JSON 会导致服务端显示 Empty Message。
       reqUrl = channel.url;
-      reqBody = "{";
-      reqBody += "\"title\":\"" + senderEscaped + "\",";
-      reqBody += "\"body\":\"" + messageEscaped + "\"";
-      reqBody += "}";
-      logCaptureLn(String("BARK JSON: " + reqBody));
+      reqContentType = "application/x-www-form-urlencoded; charset=utf-8";
+      reqBody = "title=" + urlEncode(String(sender));
+      reqBody += "&body=" + urlEncode(String(message));
+      logCaptureLn(String("Bark 表单请求已构建"));
       break;
     }
 
@@ -322,7 +317,7 @@ void sendToChannel(const PushChannel& channel, const char* sender, const char* m
       // 自定义模板
       if (channel.customBody.length() == 0) {
         logCaptureLn(String("自定义模板为空，跳过"));
-        return;
+        return false;
       }
       reqUrl = channel.url;
       reqBody = channel.customBody;
@@ -403,17 +398,17 @@ void sendToChannel(const PushChannel& channel, const char* sender, const char* m
 
     default:
       logCaptureLn(String("未知推送类型"));
-      return;
+      return false;
   }
 
-  executeChannelRequest(channel, reqUrl, useGet, reqContentType, reqBody, channelName);
+  return executeChannelRequest(channel, reqUrl, useGet, reqContentType, reqBody, channelName);
 }
 
 // 发送短信到所有启用的推送通道
-void sendSMSToServer(const char* sender, const char* message, const char* timestamp) {
+bool sendSMSToServer(const char* sender, const char* message, const char* timestamp) {
   if (WiFi.status() != WL_CONNECTED) {
-    logCaptureLn(String("WiFi未连接，跳过推送"));
-    return;
+    logCaptureLn(String("WiFi未连接，保留短信等待重试"));
+    return false;
   }
   
   bool hasEnabledChannel = false;
@@ -426,15 +421,18 @@ void sendSMSToServer(const char* sender, const char* message, const char* timest
   
   if (!hasEnabledChannel) {
     logCaptureLn(String("没有启用的推送通道"));
-    return;
+    return false;
   }
   
   logCaptureLn(String("\n=== 开始多通道推送 ==="));
+  bool anySuccess = false;
   for (int i = 0; i < MAX_PUSH_CHANNELS; i++) {
     if (isPushChannelValid(config.pushChannels[i])) {
-      sendToChannel(config.pushChannels[i], sender, message, timestamp);
+      if (sendToChannel(config.pushChannels[i], sender, message, timestamp)) anySuccess = true;
       delay(100); // 短暂延迟避免请求过快
     }
   }
-  logCaptureLn(String("=== 多通道推送完成 ===\n"));
+  logCaptureLn(anySuccess ? String("=== 多通道推送成功 ===\n")
+                          : String("=== 多通道推送失败 ===\n"));
+  return anySuccess;
 }

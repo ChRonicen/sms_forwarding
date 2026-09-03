@@ -36,7 +36,7 @@ void setup() {
   WiFi.begin(WIFI_SSID, WIFI_PASS);
   logCaptureLn(String("连接wifi: ") + String(WIFI_SSID));
 
-  // 带超时的等待连接，失败则重启重试
+  // 带超时的等待连接；WiFi 不可用时仍继续初始化模组，以便短信保留在 SIM 中。
   unsigned long wifiStart = millis();
   const unsigned long WIFI_TIMEOUT = 20000; // 20秒超时
   while (WiFi.status() != WL_CONNECTED && millis() - wifiStart < WIFI_TIMEOUT) {
@@ -50,9 +50,7 @@ void setup() {
     logCapture(String("信号强度(RSSI): "));
     logCaptureLn(String(WiFi.RSSI()) + " dBm");
   } else {
-    logCaptureLn(String("⚠️ WiFi连接超时，即将重启重试..."));
-    delay(1000);
-    ESP.restart();
+    logCaptureLn(String("⚠️ WiFi连接超时，模组仍将初始化，WiFi在后台自动重连"));
   }
 
   server.on("/", handleRoot);
@@ -74,11 +72,10 @@ void setup() {
   // ---- NTP 时间同步 ----
   logCaptureLn(String("正在同步NTP时间..."));
   configTime(0, 0, "ntp.ntsc.ac.cn", "ntp.aliyun.com", "pool.ntp.org");
-  int ntpRetry = 0;
-  while (time(nullptr) < 100000 && ntpRetry < 100) {
-    delay(1);
+  unsigned long ntpStart = millis();
+  while (time(nullptr) < 100000 && millis() - ntpStart < 10000) {
+    delay(100);
     server.handleClient();
-    ntpRetry++;
   }
   if (time(nullptr) >= 100000) {
     timeSynced = true;
@@ -92,6 +89,7 @@ void setup() {
 
   ssl_client.setInsecure();
   digitalWrite(LED_BUILTIN, LOW);
+  initSmsDeliveryGuard();
 
   // ---- 启动通知（网页已可用，发邮件不会影响用户访问） ----
   if (configValid) {
@@ -116,4 +114,6 @@ void loop() {
   checkConcatTimeout();
   if (Serial.available()) Serial1.write(Serial.read());
   checkSerial1URC();
+  pollStoredSms();
+  processPendingSmsDeletes();
 }

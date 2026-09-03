@@ -44,6 +44,9 @@ struct Config {
   String webUser;      // Web管理账号
   String webPass;      // Web管理密码
   String numberBlackList;  // 号码黑名单（换行符分隔）
+  uint8_t operatorMode;     // 0=自动选网, 1=手动选网
+  String operatorCode;      // PLMN（MCC+MNC，例如 46000）
+  uint8_t operatorAct;      // 3GPP AcT：0=GSM, 2=UTRAN, 7=LTE
 };
 
 // 默认Web管理账号密码
@@ -71,6 +74,7 @@ struct ConcatSms {
   int receivedParts;                    // 已收到的分段数
   unsigned long firstPartTime;          // 收到第一个分段的时间
   SmsPart parts[MAX_CONCAT_PARTS];      // 各分段内容
+  int16_t storedIndices[MAX_CONCAT_PARTS]; // 对应的模组存储索引，投递成功后再删除
 };
 
 #endif
