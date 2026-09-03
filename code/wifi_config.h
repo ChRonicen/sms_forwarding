@@ -1,3 +1,4 @@
-//WIFI - 仍使用宏定义，因为需要先联网才能配置其他参数
-#define WIFI_SSID "你家wifi"
-#define WIFI_PASS "你家wifi密码"
+#pragma once
+
+// 真实凭据只放在本机的 wifi_config_local.h，不应提交到仓库。
+#include "wifi_config_local.h"

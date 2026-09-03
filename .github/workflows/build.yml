@@ -23,13 +23,14 @@ jobs:
         arduino-cli config init
         arduino-cli config add board_manager.additional_urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
         arduino-cli core update-index
-        arduino-cli core install esp32:esp32
+        arduino-cli core install esp32:esp32@3.3.10
     
     - name: Install dependencies
       run: |
-        arduino-cli lib install "pdulib"
-        arduino-cli lib install "ReadyMail"
+        arduino-cli lib install "pdulib@0.5.11"
+        arduino-cli lib install "ReadyMail@0.4.2"
     
     - name: Compile firmware
       run: |
+        cp code/wifi_config.example.h code/wifi_config_local.h
         arduino-cli compile --fqbn "esp32:esp32:makergo_c3_supermini:PartitionScheme=huge_app" ./code
